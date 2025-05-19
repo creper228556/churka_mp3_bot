@@ -10,4 +10,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD ["python", "your_bot_file.py"]
+CMD ["python", "churka_mp3_bot.py"]
