@@ -1,2 +1,0 @@
-[phases.setup]
-nixPkgs = ["python39", "gcc", "sqlite"]
