@@ -22,6 +22,7 @@ def setup_commands():
         BotCommand("start", "Начать работу с ботом"),
         BotCommand("progress", "Ваш текущий прогресс"),
         BotCommand("settime", "Изменить время напоминаний"),
+        BotCommand("timezone", "Изменить часовой пояс"),
         BotCommand("help", "Помощь по командам")
     ]
     bot.set_my_commands(commands)
@@ -39,13 +40,13 @@ def init_db():
         max_streak INTEGER DEFAULT 0,
         last_reminder_date TEXT,
         last_message_id INTEGER,
+        timezone TEXT DEFAULT '+03:00',
         PRIMARY KEY (user_id, habit)
     )
     ''')
     conn.commit()
     return conn, cursor
 
-# Инициализация БД при старте
 db_conn, db_cursor = init_db()
 
 @bot.message_handler(commands=['start'])
@@ -101,21 +102,19 @@ def ask_habit(message):
         )
         db_conn.commit()
         
-        cancel_markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-        cancel_markup.add(types.KeyboardButton("Отмена❌"))
-        
-        bot.send_message(
-            message.chat.id,
-            f"Привычка '{habit}' успешно добавлена!",
-            reply_markup=types.ReplyKeyboardRemove()
+        timezone_markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+        timezone_markup.add(
+            types.KeyboardButton("Москва (+3)"),
+            types.KeyboardButton("Киев (+2)"),
+            types.KeyboardButton("Другой")
         )
         
         bot.send_message(
             message.chat.id,
-            "Во сколько вы хотите получать уведомления о привычке? (ЧЧ:ММ)\n(Например 08:30)",
-            reply_markup=cancel_markup
+            "Выберите ваш часовой пояс:",
+            reply_markup=timezone_markup
         )
-        bot.register_next_step_handler(message, validate_time_input)
+        bot.register_next_step_handler(message, set_timezone)
         
     except sqlite3.Error as e:
         bot.send_message(
@@ -123,6 +122,66 @@ def ask_habit(message):
             "Произошла ошибка при сохранении привычки"
         )
         print("DB Error:", e)
+
+def set_timezone(message):
+    timezone_map = {
+        "Москва (+3)": "+03:00",
+        "Киев (+2)": "+02:00"
+    }
+    
+    if message.text in timezone_map:
+        timezone = timezone_map[message.text]
+    elif message.text == "Другой":
+        bot.send_message(
+            message.chat.id,
+            "Введите ваш часовой пояс в формате ±HH:MM (например, +05:00 или -08:00):",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
+        bot.register_next_step_handler(message, validate_custom_timezone)
+        return
+    else:
+        bot.send_message(message.chat.id, "Пожалуйста, выберите вариант из предложенных")
+        return ask_habit(message)
+    
+    db_cursor.execute(
+        "UPDATE habits SET timezone = ? WHERE user_id = ?",
+        (timezone, message.chat.id)
+    )
+    db_conn.commit()
+    
+    cancel_markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    cancel_markup.add(types.KeyboardButton("Отмена❌"))
+    bot.send_message(
+        message.chat.id,
+        "Во сколько вы хотите получать уведомления о привычке? (ЧЧ:ММ)\n"
+        "Укажите время в вашем часовом поясе (например 08:30)",
+        reply_markup=cancel_markup
+    )
+    bot.register_next_step_handler(message, validate_time_input)
+
+def validate_custom_timezone(message):
+    if not re.match(r'^[+-](0[0-9]|1[0-2]):[0-5][0-9]$', message.text):
+        bot.send_message(
+            message.chat.id,
+            "Неверный формат часового пояса. Пожалуйста, используйте формат ±HH:MM (например, +05:00 или -08:00)"
+        )
+        return ask_habit(message)
+    
+    db_cursor.execute(
+        "UPDATE habits SET timezone = ? WHERE user_id = ?",
+        (message.text, message.chat.id)
+    )
+    db_conn.commit()
+    
+    cancel_markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    cancel_markup.add(types.KeyboardButton("Отмена❌"))
+    bot.send_message(
+        message.chat.id,
+        "Во сколько вы хотите получать уведомления о привычке? (ЧЧ:ММ)\n"
+        "Укажите время в вашем часовом поясе (например 08:30)",
+        reply_markup=cancel_markup
+    )
+    bot.register_next_step_handler(message, validate_time_input)
 
 def validate_time_input(message):
     if message.text == "Отмена❌":
@@ -151,11 +210,20 @@ def validate_time_input(message):
         )
         db_conn.commit()
 
+        # Получаем часовой пояс для отображения
+        db_cursor.execute(
+            "SELECT timezone FROM habits WHERE user_id = ? LIMIT 1",
+            (message.chat.id,)
+        )
+        timezone = db_cursor.fetchone()[0]
+
         bot.send_message(
             message.chat.id,
-            f"✅ Отлично! Буду напоминать о привычке каждый день в {time_input}.",
+            f"✅ Отлично! Буду напоминать о привычке каждый день в {time_input} "
+            f"(по вашему местному времени, часовой пояс {timezone}).",
             reply_markup=types.ReplyKeyboardRemove()
         )
+
     except sqlite3.Error as e:
         bot.send_message(
             message.chat.id,
@@ -164,46 +232,67 @@ def validate_time_input(message):
         print("DB Error:", e)
 
 def send_reminders():
-    now = datetime.datetime.now()
-    current_time = now.strftime("%H:%M")
-    today_date = now.strftime("%Y-%m-%d")
+    now_utc = datetime.datetime.utcnow()
+    
+    # Получаем всех пользователей с их часовыми поясами
+    db_cursor.execute(
+        "SELECT DISTINCT user_id, timezone FROM habits WHERE reminder_time IS NOT NULL"
+    )
+    users = db_cursor.fetchall()
+    
+    for user_id, timezone in users:
+        try:
+            # Преобразуем часовой пояс в timedelta
+            tz_sign = 1 if timezone[0] == '+' else -1
+            tz_hours = int(timezone[1:3])
+            tz_minutes = int(timezone[4:6])
+            tz_delta = datetime.timedelta(
+                hours=tz_hours * tz_sign,
+                minutes=tz_minutes * tz_sign
+            )
+            
+            # Вычисляем локальное время пользователя
+            user_local_time = now_utc + tz_delta
+            current_time_str = user_local_time.strftime("%H:%M")
+            today_date = user_local_time.strftime("%Y-%m-%d")
+            
+            # Проверяем, нужно ли отправлять напоминание
+            db_cursor.execute(
+                """SELECT habit FROM habits 
+                WHERE user_id = ? 
+                AND reminder_time = ?
+                AND (last_reminder_date IS NULL OR last_reminder_date != ?)""",
+                (user_id, current_time_str, today_date)
+            )
+            habits = db_cursor.fetchall()
+            
+            for (habit,) in habits:
+                markup = types.InlineKeyboardMarkup()
+                yes_btn = types.InlineKeyboardButton("✅ Сделал", callback_data=f"done_{habit}")
+                no_btn = types.InlineKeyboardButton("❌ Пропустил", callback_data=f"skip_{habit}")
+                markup.add(yes_btn, no_btn)
 
-    try:
-        db_cursor.execute(
-            """SELECT user_id, habit FROM habits 
-            WHERE reminder_time = ? 
-            AND (last_reminder_date IS NULL OR last_reminder_date != ?)""",
-            (current_time, today_date)
-        )
-        users = db_cursor.fetchall()
+                try:
+                    sent_msg = bot.send_message(
+                        user_id,
+                        f"⏰ Напоминание: {habit}! Ты сегодня выполнил?",
+                        reply_markup=markup
+                    )
 
-        for user_id, habit in users:
-            markup = types.InlineKeyboardMarkup()
-            yes_btn = types.InlineKeyboardButton("✅ Сделал", callback_data=f"done_{habit}")
-            no_btn = types.InlineKeyboardButton("❌ Пропустил", callback_data=f"skip_{habit}")
-            markup.add(yes_btn, no_btn)
+                    db_cursor.execute(
+                        """UPDATE habits 
+                        SET last_reminder_date = ?, 
+                        last_message_id = ? 
+                        WHERE user_id = ? AND habit = ?""",
+                        (today_date, sent_msg.message_id, user_id, habit)
+                    )
+                    db_conn.commit()
 
-            try:
-                sent_msg = bot.send_message(
-                    user_id,
-                    f"⏰ Напоминание: {habit}! Ты сегодня выполнил?",
-                    reply_markup=markup
-                )
-
-                db_cursor.execute(
-                    """UPDATE habits 
-                    SET last_reminder_date = ?, 
-                    last_message_id = ? 
-                    WHERE user_id = ? AND habit = ?""",
-                    (today_date, sent_msg.message_id, user_id, habit)
-                )
-                db_conn.commit()
-
-            except Exception as e:
-                print(f"Ошибка при отправке: {e}")
-
-    except sqlite3.Error as e:
-        print(f"Ошибка при запросе к БД: {e}")
+                except Exception as e:
+                    print(f"Ошибка при отправке пользователю {user_id}: {e}")
+                    
+        except Exception as e:
+            print(f"Ошибка при обработке пользователя {user_id}: {e}")
 
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback(call):
@@ -276,6 +365,7 @@ def show_help(message):
 /start - Начать работу с ботом
 /progress - Показать текущий прогресс
 /settime - Изменить время напоминания
+/timezone - Изменить часовой пояс
 /help - Показать это сообщение
 
 ℹ️ Просто введите команду или нажмите на неё в меню.
@@ -308,6 +398,74 @@ def progress(message):
         print("Error:", e)
         bot.send_message(message.chat.id, "Неизвестная ошибка 😢")
 
+@bot.message_handler(commands=['timezone'])
+def change_timezone(message):
+    timezone_markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    timezone_markup.add(
+        types.KeyboardButton("Москва (+3)"),
+        types.KeyboardButton("Киев (+2)"),
+        types.KeyboardButton("Другой")
+    )
+    
+    bot.send_message(
+        message.chat.id,
+        "Выберите ваш часовой пояс:",
+        reply_markup=timezone_markup
+    )
+    bot.register_next_step_handler(message, process_timezone_change)
+
+def process_timezone_change(message):
+    timezone_map = {
+        "Москва (+3)": "+03:00",
+        "Киев (+2)": "+02:00"
+    }
+    
+    if message.text in timezone_map:
+        timezone = timezone_map[message.text]
+    elif message.text == "Другой":
+        bot.send_message(
+            message.chat.id,
+            "Введите ваш часовой пояс в формате ±HH:MM (например, +05:00 или -08:00):",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
+        bot.register_next_step_handler(message, process_custom_timezone)
+        return
+    else:
+        bot.send_message(message.chat.id, "Пожалуйста, выберите вариант из предложенных")
+        return change_timezone(message)
+    
+    db_cursor.execute(
+        "UPDATE habits SET timezone = ? WHERE user_id = ?",
+        (timezone, message.chat.id)
+    )
+    db_conn.commit()
+    
+    bot.send_message(
+        message.chat.id,
+        f"Часовой пояс успешно изменен на {timezone}",
+        reply_markup=types.ReplyKeyboardRemove()
+    )
+
+def process_custom_timezone(message):
+    if not re.match(r'^[+-](0[0-9]|1[0-2]):[0-5][0-9]$', message.text):
+        bot.send_message(
+            message.chat.id,
+            "Неверный формат часового пояса. Пожалуйста, используйте формат ±HH:MM (например, +05:00 или -08:00)"
+        )
+        return change_timezone(message)
+    
+    db_cursor.execute(
+        "UPDATE habits SET timezone = ? WHERE user_id = ?",
+        (message.text, message.chat.id)
+    )
+    db_conn.commit()
+    
+    bot.send_message(
+        message.chat.id,
+        f"Часовой пояс успешно изменен на {message.text}",
+        reply_markup=types.ReplyKeyboardRemove()
+    )
+
 def reminder_scheduler():
     while True:
         try:
@@ -333,7 +491,6 @@ def run_bot():
 
 if __name__ == "__main__":
     try:
-        # Запуск Flask в отдельном потоке
         flask_thread = threading.Thread(
             target=app.run,
             kwargs={'host': '0.0.0.0', 'port': int(os.environ.get('PORT', 5000))},
